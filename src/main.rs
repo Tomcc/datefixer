@@ -4,7 +4,10 @@ extern crate rocksdb;
 extern crate filetime;
 extern crate twox_hash;
 extern crate bytes;
+extern crate threadpool;
+extern crate num_cpus;
 
+use threadpool::ThreadPool;
 use bytes::{BufMut, LittleEndian};
 use clap::{Arg, App};
 use std::path::{Path, PathBuf};
@@ -19,6 +22,9 @@ use std::io;
 use std::io::Cursor;
 use std::hash::Hasher;
 use filetime::FileTime;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::Condvar;
 
 fn make_fingerprint(path: &Path) -> io::Result<u64> {
     let mut hasher = twox_hash::XxHash::default();
@@ -66,7 +72,7 @@ impl<'a> FileRecord<'a> {
     }
 }
 
-fn add_record(db: &mut DB, path: &Path) -> io::Result<()> {
+fn add_record(db: &DB, path: &Path) -> io::Result<()> {
     let record = FileRecord::from_path(path)?;
 
     db.put(record.key, &record.make_db_value()).unwrap();
@@ -104,37 +110,62 @@ fn main() {const VERSION: &'static str = env!("CARGO_PKG_VERSION");
     temp_path.push("datafixer");
     fs::create_dir_all(&temp_path).unwrap();    
 
+    //HACK
+    DB::destroy(&rocksdb::Options::default(), &temp_path).unwrap();
+
     //open or create the database
-    let mut db = DB::open_default(&temp_path).unwrap();
+    let db = Arc::new(DB::open_default(&temp_path).unwrap());
+
+    //create other thread management stuff
+    let pool = ThreadPool::new(num_cpus::get() * 2);
+    let count = Arc::new(Mutex::new(0));
+    let signal = Arc::new(Condvar::new());
+    let mut total_tasks = 0;
 
     for entry in WalkDir::new(path) {
         let entry = entry.unwrap();
 
-        let path = &entry.path();
-        let extension = path.extension().unwrap_or_default().to_str().unwrap();
+        let path = entry.path().to_owned();
+        let extension = entry.path().extension().unwrap_or_default().to_str().unwrap();
 
         if valid_extensions.contains(extension) {
+
+            let db = db.clone(); //make a db handle for the task
+            let count = count.clone();
+            let signal = signal.clone();
+            total_tasks += 1;
+
+            pool.execute(move || {
             //try to retrieve the file's last seen modified date. path is the key
-            let key = make_key(path);
+                let key = make_key(&path);
+                match db.get(key) {
+                    Ok(Some(_)) => {
+                        //found! Compare the times. 
 
-            match db.get(key) {
-                Ok(Some(value)) => {
-                    //found! Compare the times. 
+                        //if same, do nothing
 
-                    //if same, do nothing
+                        //otherwise if size or hash differs, store the current date
 
-                    //otherwise if size or hash differs, store the current date
-
-                    //otherwise put back the old date into the file
+                        //otherwise put back the old date into the file
+                    }
+                    Ok(None) => {
+                        //not found at all. Just record this file
+                        add_record(&db, &path).unwrap();
+                    }
+                    Err(e) => println!("operational problem encountered: {}", e),
                 }
-                Ok(None) => {
-                    //not found at all. Just record this file
-                    add_record(&mut db, path).unwrap();
-                }
-                Err(e) => println!("operational problem encountered: {}", e),
-            }
+
+                //signal done
+                *count.as_ref().lock().unwrap() += 1;
+                signal.as_ref().notify_one();
+            });
         }
     }
 
-
+    //wait on everything being done
+    let mut count = count.lock().unwrap();
+    // As long as the value inside the `Mutex` is false, we wait.
+    while *count < total_tasks {
+        count = signal.wait(count).unwrap();
+    }
 }
