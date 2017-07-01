@@ -1,0 +1,12 @@
+[package]
+name = "datefixer"
+version = "0.1.0"
+authors = ["Tommaso Checchi <tommaso.checchi1@gmail.com>"]
+
+[dependencies]
+rocksdb = "0.6.0"
+clap = "2.25.0"
+walkdir = "1.0.7"
+filetime = "0.1.10"
+twox-hash = "1.1.0"
+bytes = "0.4"
