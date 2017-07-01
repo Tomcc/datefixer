@@ -25,15 +25,24 @@ use filetime::FileTime;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Condvar;
+use std::cell::RefCell;
+
+thread_local!{
+    static READ_BUFFER: RefCell<Vec<u8>> = RefCell::new(vec![]);
+}
 
 fn make_fingerprint(path: &Path) -> io::Result<u64> {
     let mut hasher = twox_hash::XxHash::default();
-    let mut buf = vec![];
     let mut file = fs::File::open(path)?;
 
-    file.read_to_end(&mut buf)?;
+    READ_BUFFER.with(|buf_rc| {
+        let mut buf = buf_rc.borrow_mut();
+        buf.clear();
+        file.read_to_end(&mut buf).unwrap();
 
-    hasher.write(&buf);
+        hasher.write(&buf);
+    });
+
     Ok(hasher.finish())
 }
 
