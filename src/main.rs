@@ -24,6 +24,8 @@ use std::hash::Hasher;
 use filetime::FileTime;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::sync::Condvar;
 use std::cell::RefCell;
 
@@ -108,10 +110,73 @@ fn add_record(db: &DB, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+struct TaskContext {
+    db: DB,
+    count: Mutex<usize>,
+    signal: Condvar,
+    fixed: AtomicUsize,
+    updated: AtomicUsize,
+    total_tasks: AtomicUsize,
+    verbose: bool
+}
+
+impl TaskContext {
+    fn new(db_path: &Path, verbose: bool) -> Self {
+        TaskContext{
+            db: DB::open_default(&db_path).unwrap(),
+            count: Mutex::new(0),
+            signal: Condvar::new(),
+            fixed: AtomicUsize::new(0),
+            updated: AtomicUsize::new(0),
+            total_tasks: AtomicUsize::new(0),
+            verbose: verbose,
+        }
+    }
+
+    fn notify_new_task(&self) {
+        self.total_tasks.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn wait(&self) {
+        let mut count = self.count.lock().unwrap();
+        // As long as the value inside the `Mutex` is false, we wait.
+        while *count < self.total_tasks.load(Ordering::Relaxed) {
+            count = self.signal.wait(count).unwrap();
+        }
+    }
+
+    fn fix(&self, path: &Path, timestamp: u64) {
+        let metadata = fs::metadata(&path).unwrap();
+        let atime = FileTime::from_creation_time(&metadata).unwrap();
+        let mtime = FileTime::from_seconds_since_1970(timestamp, 0);
+        filetime::set_file_times(&path, atime, mtime).unwrap();
+        
+        self.fixed.fetch_add(1, Ordering::SeqCst);
+        if self.verbose {
+            println!("Fixed {}", path.display());
+        }
+    }
+
+    fn update(&self, path: &Path, key: &[u8], new_record: FileRecord) {
+        self.db.put(key, &new_record.make_db_value()).unwrap();
+
+        self.updated.fetch_add(1, Ordering::SeqCst);
+        if self.verbose {
+            println!("Updated {}", path.display());
+        }
+    }
+
+    fn print_info(&self) {
+        let updated = self.updated.load(Ordering::Relaxed);
+        let fixed = self.fixed.load(Ordering::Relaxed);
+        println!("Done! {} files changed and {} timestamps fixed", updated, fixed);
+    }
+}
+
 fn main() {
     const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
-    let matches = App::new("DateFixer")
+    let cmd_line = App::new("DateFixer")
         .version(VERSION)
         .about("Restores the last modified date on files that haven't changed (or changed back) since then")
         .arg(Arg::with_name("root_path")
@@ -119,10 +184,16 @@ fn main() {
             .value_name("Path")
             .takes_value(true)
             .required(true))
+        .arg(Arg::with_name("verbose")
+            .help("Show the path to each file updated or fixed")
+            .value_name("verbose mode")
+            .takes_value(false)
+            .short("v")
+            .long("verbose"))
         .get_matches();
 
         
-    let path = PathBuf::from(matches.value_of("root_path").unwrap());
+    let path = PathBuf::from(cmd_line.value_of("root_path").unwrap());
     
     if !path.is_dir() {
         println!("{} is not a file, or couldn't be found!", path.display());
@@ -139,14 +210,11 @@ fn main() {
     temp_path.push("datafixer");
     fs::create_dir_all(&temp_path).unwrap();    
 
-    //open or create the database
-    let db = Arc::new(DB::open_default(&temp_path).unwrap());
+    let verbose = cmd_line.is_present("verbose");
 
-    //create other thread management stuff
+    //create the database and other context variables
+    let ctx = Arc::new(TaskContext::new(&temp_path, verbose));
     let pool = ThreadPool::new(num_cpus::get() * 2);
-    let count = Arc::new(Mutex::new(0));
-    let signal = Arc::new(Condvar::new());
-    let mut total_tasks = 0;
 
     for entry in WalkDir::new(path) {
         let entry = entry.unwrap();
@@ -155,16 +223,14 @@ fn main() {
         let extension = entry.path().extension().unwrap_or_default().to_str().unwrap();
 
         if valid_extensions.contains(extension) {
-
-            let db = db.clone();
-            let count = count.clone();
-            let signal = signal.clone();
-            total_tasks += 1;
+            ctx.notify_new_task();
+            let ctx = ctx.clone();
 
             pool.execute(move || {
             //try to retrieve the file's last seen modified date. path is the key
                 let key = make_key(&path);
-                match db.get(key) {
+                let ctx = ctx.as_ref();
+                match ctx.db.get(key) {
                     Ok(Some(value)) => {
                         //found! Get a record and compare the times. 
                         let file_record = FileRecord::from_db(&value);
@@ -181,40 +247,29 @@ fn main() {
                                     timestamp: new_timestamp,
                                     fingerprint: fingerprint,
                                 };
-                                db.put(&key, &new_record.make_db_value()).unwrap();
-
-                                println!("Updated {} size changed: {} - hash changed: {}", path.display(), new_size != file_record.size, fingerprint != file_record.fingerprint);
+                                ctx.update(&path, key, new_record);
                             }
                             else {
                                 //ok, everything was the same, only the timestamp changed. Roll it back!
-                                
-                                let metadata = fs::metadata(&path).unwrap();
-                                let atime = FileTime::from_creation_time(&metadata).unwrap();
-                                let mtime = FileTime::from_seconds_since_1970(file_record.timestamp, 0);
-                                filetime::set_file_times(&path, atime, mtime).unwrap();
-                                
-                                println!("Fixed {}", path.display());
+                                ctx.fix(&path, file_record.timestamp);
                             }
                         }
                     }
                     Ok(None) => {
                         //not found at all. Just record this file
-                        add_record(&db, &path).unwrap();
+                        add_record(&ctx.db, &path).unwrap();
                     }
                     Err(e) => println!("Database error!\n {}", e),
                 }
 
                 //signal done
-                *count.as_ref().lock().unwrap() += 1;
-                signal.as_ref().notify_one();
+                *ctx.count.lock().unwrap() += 1;
+                ctx.signal.notify_one();
             });
         }
     }
 
     //wait on everything being done
-    let mut count = count.lock().unwrap();
-    // As long as the value inside the `Mutex` is false, we wait.
-    while *count < total_tasks {
-        count = signal.wait(count).unwrap();
-    }
+    ctx.wait();
+    ctx.print_info();
 }
