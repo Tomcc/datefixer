@@ -8,7 +8,7 @@ extern crate threadpool;
 extern crate num_cpus;
 
 use threadpool::ThreadPool;
-use bytes::{BufMut, LittleEndian};
+use bytes::{BufMut, LittleEndian, Buf};
 use clap::{Arg, App};
 use std::path::{Path, PathBuf};
 use std::process;
@@ -31,9 +31,10 @@ thread_local!{
     static READ_BUFFER: RefCell<Vec<u8>> = RefCell::new(vec![]);
 }
 
-fn make_fingerprint(path: &Path) -> io::Result<u64> {
+fn make_fingerprint(path: &Path) -> io::Result<(u64, u64)> {
     let mut hasher = twox_hash::XxHash::default();
     let mut file = fs::File::open(path)?;
+    let mut len = 0 as u64;
 
     READ_BUFFER.with(|buf_rc| {
         let mut buf = buf_rc.borrow_mut();
@@ -41,55 +42,74 @@ fn make_fingerprint(path: &Path) -> io::Result<u64> {
         file.read_to_end(&mut buf).unwrap();
 
         hasher.write(&buf);
+        len = buf.len() as u64;
     });
 
-    Ok(hasher.finish())
+    Ok((hasher.finish(), len))
 }
 
+fn timestamp_from_metadata(metadata: &fs::Metadata) -> u64 {
+    FileTime::from_last_modification_time(&metadata).seconds_relative_to_1970()
+}
 fn get_timestamp(path: &Path) -> io::Result<u64> {
     let metadata = fs::metadata(path)?;
 
-    Ok(FileTime::from_last_modification_time(&metadata).seconds_relative_to_1970())
+    Ok(timestamp_from_metadata(&metadata))
 }
 
 fn make_key(path: &Path) -> &[u8] {
     path.to_str().unwrap().as_bytes()
 }
 
-struct FileRecord<'a> {
+#[derive(Debug)]
+struct FileRecord {
     fingerprint: u64,
     timestamp: u64,
-    key: &'a [u8],
+    size: u64,
 }
 
-impl<'a> FileRecord<'a> {
-    fn from_path(path: &'a Path) -> io::Result<Self> {
+type BinaryDBValue = [u8; 8 * 3];
+
+impl FileRecord {
+    fn from_path(path: &Path) -> io::Result<Self> {
+        let (fingerprint, size) = make_fingerprint(path)?;
         Ok(FileRecord{
-            fingerprint: make_fingerprint(path)?,
+            fingerprint: fingerprint,
             timestamp: get_timestamp(path)?,
-            key: make_key(path)
+            size: size,
         })
     }
 
-    fn make_db_value(&self) -> [u8; 16] {
-        let bytes = [0 as u8; 16];
-        let mut buf = Cursor::new(bytes);
+    fn from_db(value: &[u8]) -> Self {
+        let mut buf = Cursor::new(value);
+        FileRecord {
+            fingerprint: buf.get_u64::<LittleEndian>(),
+            timestamp: buf.get_u64::<LittleEndian>(),
+            size: buf.get_u64::<LittleEndian>(),
+        }
+    }
+
+    fn make_db_value(&self) -> BinaryDBValue {
+        let mut buf = Cursor::new(BinaryDBValue::default());
 
         buf.put_u64::<LittleEndian>(self.fingerprint);
         buf.put_u64::<LittleEndian>(self.timestamp);
-        bytes
+        buf.put_u64::<LittleEndian>(self.size);        
+        
+        buf.into_inner()
     }
 }
 
 fn add_record(db: &DB, path: &Path) -> io::Result<()> {
     let record = FileRecord::from_path(path)?;
 
-    db.put(record.key, &record.make_db_value()).unwrap();
+    db.put(make_key(path), &record.make_db_value()).unwrap();
     
     Ok(())
 }
 
-fn main() {const VERSION: &'static str = env!("CARGO_PKG_VERSION");
+fn main() {
+    const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
     let matches = App::new("DateFixer")
         .version(VERSION)
@@ -119,9 +139,6 @@ fn main() {const VERSION: &'static str = env!("CARGO_PKG_VERSION");
     temp_path.push("datafixer");
     fs::create_dir_all(&temp_path).unwrap();    
 
-    //HACK
-    DB::destroy(&rocksdb::Options::default(), &temp_path).unwrap();
-
     //open or create the database
     let db = Arc::new(DB::open_default(&temp_path).unwrap());
 
@@ -139,7 +156,7 @@ fn main() {const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
         if valid_extensions.contains(extension) {
 
-            let db = db.clone(); //make a db handle for the task
+            let db = db.clone();
             let count = count.clone();
             let signal = signal.clone();
             total_tasks += 1;
@@ -148,20 +165,43 @@ fn main() {const VERSION: &'static str = env!("CARGO_PKG_VERSION");
             //try to retrieve the file's last seen modified date. path is the key
                 let key = make_key(&path);
                 match db.get(key) {
-                    Ok(Some(_)) => {
-                        //found! Compare the times. 
+                    Ok(Some(value)) => {
+                        //found! Get a record and compare the times. 
+                        let file_record = FileRecord::from_db(&value);
+                        let new_timestamp = get_timestamp(&path).unwrap();
+                        
+                        if file_record.timestamp != new_timestamp {
+                            //timestamps are different...
+                            let (fingerprint, new_size) = make_fingerprint(&path).unwrap();
 
-                        //if same, do nothing
+                            if new_size != file_record.size || fingerprint != file_record.fingerprint {
+                                //size changed, or fingerprint changed, it can't be the same. make a new record to write out
+                                let new_record = FileRecord{
+                                    size: new_size,
+                                    timestamp: new_timestamp,
+                                    fingerprint: fingerprint,
+                                };
+                                db.put(&key, &new_record.make_db_value()).unwrap();
 
-                        //otherwise if size or hash differs, store the current date
-
-                        //otherwise put back the old date into the file
+                                println!("Updated {} size changed: {} - hash changed: {}", path.display(), new_size != file_record.size, fingerprint != file_record.fingerprint);
+                            }
+                            else {
+                                //ok, everything was the same, only the timestamp changed. Roll it back!
+                                
+                                let metadata = fs::metadata(&path).unwrap();
+                                let atime = FileTime::from_creation_time(&metadata).unwrap();
+                                let mtime = FileTime::from_seconds_since_1970(file_record.timestamp, 0);
+                                filetime::set_file_times(&path, atime, mtime).unwrap();
+                                
+                                println!("Fixed {}", path.display());
+                            }
+                        }
                     }
                     Ok(None) => {
                         //not found at all. Just record this file
                         add_record(&db, &path).unwrap();
                     }
-                    Err(e) => println!("operational problem encountered: {}", e),
+                    Err(e) => println!("Database error!\n {}", e),
                 }
 
                 //signal done
